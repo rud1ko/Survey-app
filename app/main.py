@@ -1,10 +1,11 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import timedelta
 from typing import List
-from . import models, schemas, auth
+from . import models, schemas, auth, tasks
 from .database import engine, get_db
+from .cache import cache, CacheManager
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -52,7 +53,7 @@ def read_users_me(current_user: models.User = Depends(auth.get_current_active_us
 
 # Survey endpoints
 @app.post("/surveys/", response_model=schemas.Survey)
-def create_survey(
+async def create_survey(
     survey: schemas.SurveyCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_active_user)
@@ -79,10 +80,15 @@ def create_survey(
     
     db.commit()
     db.refresh(db_survey)
+    
+    # Invalidate cache
+    await CacheManager.invalidate_survey(db_survey.id)
+    
     return db_survey
 
 @app.get("/surveys/", response_model=List[schemas.Survey])
-def read_surveys(
+@cache(expire=300)
+async def read_surveys(
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
@@ -92,14 +98,23 @@ def read_surveys(
     return surveys
 
 @app.get("/surveys/{survey_id}", response_model=schemas.Survey)
-def read_survey(
+@cache(expire=300)
+async def read_survey(
     survey_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_active_user)
 ):
+    # Try to get from cache first
+    cached_survey = await CacheManager.get_survey(survey_id)
+    if cached_survey:
+        return cached_survey
+
     survey = db.query(models.Survey).filter(models.Survey.id == survey_id).first()
     if survey is None:
         raise HTTPException(status_code=404, detail="Survey not found")
+    
+    # Cache the survey
+    await CacheManager.set_survey(survey_id, survey)
     return survey
 
 # Category endpoints
@@ -116,7 +131,8 @@ def create_category(
     return db_category
 
 @app.get("/categories/", response_model=List[schemas.Category])
-def read_categories(
+@cache(expire=300)
+async def read_categories(
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db)
@@ -126,8 +142,9 @@ def read_categories(
 
 # Answer endpoints
 @app.post("/answers/", response_model=schemas.Answer)
-def create_answer(
+async def create_answer(
     answer: schemas.AnswerCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_active_user)
 ):
@@ -140,10 +157,21 @@ def create_answer(
     db.add(db_answer)
     db.commit()
     db.refresh(db_answer)
+    
+    # Invalidate cache for the survey
+    question = db.query(models.Question).filter(models.Question.id == answer.question_id).first()
+    if question:
+        await CacheManager.invalidate_survey(question.survey_id)
+        await CacheManager.invalidate_survey_results(question.survey_id)
+        
+        # Schedule background tasks
+        background_tasks.add_task(tasks.send_survey_notification, question.survey_id, current_user.id)
+    
     return db_answer
 
 @app.get("/answers/", response_model=List[schemas.Answer])
-def read_answers(
+@cache(expire=300)
+async def read_answers(
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
@@ -156,8 +184,9 @@ def read_answers(
 
 # Result endpoints
 @app.post("/results/", response_model=schemas.Result)
-def create_result(
+async def create_result(
     result: schemas.ResultCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_active_user)
 ):
@@ -182,10 +211,19 @@ def create_result(
     
     db.commit()
     db.refresh(db_result)
+    
+    # Invalidate cache
+    await CacheManager.invalidate_survey_results(result.survey_id)
+    
+    # Schedule background tasks
+    background_tasks.add_task(tasks.generate_survey_report, result.survey_id)
+    background_tasks.add_task(tasks.send_survey_notification, result.survey_id, current_user.id)
+    
     return db_result
 
 @app.get("/results/", response_model=List[schemas.Result])
-def read_results(
+@cache(expire=300)
+async def read_results(
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
@@ -197,7 +235,8 @@ def read_results(
     return results
 
 @app.get("/results/{result_id}", response_model=schemas.Result)
-def read_result(
+@cache(expire=300)
+async def read_result(
     result_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_active_user)
@@ -208,4 +247,44 @@ def read_result(
     ).first()
     if result is None:
         raise HTTPException(status_code=404, detail="Result not found")
-    return result 
+    return result
+
+# Export endpoints
+@app.post("/surveys/{survey_id}/export")
+async def export_survey(
+    survey_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user)
+):
+    # Check if survey exists and user has access
+    survey = db.query(models.Survey).filter(models.Survey.id == survey_id).first()
+    if not survey:
+        raise HTTPException(status_code=404, detail="Survey not found")
+    
+    # Schedule export task
+    task = tasks.export_survey_data.delay(survey_id)
+    
+    return {
+        "message": "Export started",
+        "task_id": task.id
+    }
+
+@app.get("/surveys/{survey_id}/report")
+async def get_survey_report(
+    survey_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user)
+):
+    # Check if survey exists and user has access
+    survey = db.query(models.Survey).filter(models.Survey.id == survey_id).first()
+    if not survey:
+        raise HTTPException(status_code=404, detail="Survey not found")
+    
+    # Generate report
+    task = tasks.generate_survey_report.delay(survey_id)
+    
+    return {
+        "message": "Report generation started",
+        "task_id": task.id
+    } 
